@@ -90,7 +90,7 @@ class RayPPOTrainer:
         )
 
         self.global_step = consumed_samples // self.cfg.rollout_batch_size
-        start_episode = consumed_samples // self.cfg.rollout_batch_size // num_rollouts_per_episodes
+        start_episode = consumed_samples // self.cfg.rollout_batch_size // num_rollouts_per_episodes # If start from a previous training loop.
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * self.cfg.rollout_batch_size)
         for episode in range(start_episode, self.cfg.num_episodes):
             pbar = tqdm(
@@ -99,7 +99,7 @@ class RayPPOTrainer:
             for iter, rand_prompts in enumerate(self.prompts_dataloader):
 
                 # 1. eval if enable eval
-                if self.cfg.enable_eval and (
+                if self.cfg.enable_eval and self.eval_dataset is not None and (
                     self.global_step % self.cfg.eval_interval == 0 or iter == len(self.prompts_dataloader) - 1
                 ):
                     await self.eval()
@@ -121,6 +121,7 @@ class RayPPOTrainer:
                     self.replay_buffer = normalize_advantages(self.replay_buffer)
 
                 # serialize replay buffer to jsonl
+                # Record each replay.
                 async with Timer("Dumping replay buffer"):
                     all_replay_buffer_save_path = os.path.join(self.cfg.save_path, "dumped_replay_buffer")
                     os.makedirs(all_replay_buffer_save_path, exist_ok=True)
@@ -130,7 +131,9 @@ class RayPPOTrainer:
                         for item in self.replay_buffer:
                             f.write(json.dumps(item.to_json()) + "\n")
 
+                # How many actor data parallel ranks
                 num_policy_dp_nodes = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
+                # How many critic data parallel ranks
                 num_critic_dp_nodes = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
                 policy_buffers = self.replay_buffer.split_to_n_batches(num_policy_dp_nodes)
                 if num_policy_dp_nodes != num_critic_dp_nodes:
@@ -138,7 +141,7 @@ class RayPPOTrainer:
                 else:
                     critic_buffers = policy_buffers
 
-                # 4. train policy/critic model
+                # 4. train policy/critic model, based on adavantages
                 if self.cfg.colocate_all:
                     if self.critic_model is not None:
                         async with Timer("Critic model training"):
@@ -181,7 +184,7 @@ class RayPPOTrainer:
                         await self.critic_model.async_save_model(self.tokenizer, self.global_step)
                     logger.info("Successfully save model weights, training continue.")
 
-            if self.cfg.update_ref_every_epoch:
+            if self.cfg.update_ref_every_epoch and not self.cfg.disable_kl:
                 await self.policy_model.backload_to_gpu()
                 await self.policy_model.async_save_model(self.tokenizer, self.global_step)
                 await self.policy_model.offload_to_cpu()
@@ -198,6 +201,7 @@ class RayPPOTrainer:
     @torch.no_grad()
     async def make_experience(self, all_inputs: Union[Tuple[str, dict], List[Tuple[str, dict]]], **generate_kwargs):
         experiences = []
+        # prompt and answers
         all_prompts = sum([[prompt[0]] * self.cfg.n_samples_per_prompt for prompt in all_inputs], [])
         all_extras = sum([[prompt[1]] * self.cfg.n_samples_per_prompt for prompt in all_inputs], [])
         # shuffle all_prompts and all_extras together
@@ -240,11 +244,12 @@ class RayPPOTrainer:
 
         assert len(all_prompts) == len(outputs), "generate objects number must be equal to all inputs number"
 
-        # 1.2 calculate custom rewards if has custom reward function
+        # 1.2 calculate custom rewards if has custom reward function based on generated results.
         if self.cfg.use_compute_reward_fn:
             async with Timer("Calculate custom rewards"):
                 dp_tasks = []
                 reward_fn = partial(self.custom_reward_fn, reward_model_fn=self._warp_custom_reward_model_fn())
+                # Acquire the final rewards.
                 all_prompts, outputs, custom_rewards = await reward_fn(all_prompts, outputs, all_extras)
                 assert len(all_prompts) == len(
                     outputs
@@ -257,6 +262,7 @@ class RayPPOTrainer:
             return
 
         # 1.3 packing samples
+        # Pack all prompts and outputs together.
         async with Timer("Packing samples"):
             (
                 ret_sequences,
@@ -337,6 +343,7 @@ class RayPPOTrainer:
         packed_seq_lens_all: Optional[List[int]],
         custom_rewards_all: Optional[List[torch.Tensor]],
     ):
+        # How many gpus each model takes. 
         num_policy_dp_groups = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
         num_critic_dp_groups = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
         num_ref_dp_groups = self.cfg.ref_num_nodes * self.cfg.ref_num_gpus_per_node
@@ -401,7 +408,7 @@ class RayPPOTrainer:
         # calculate ref log probs
         base_action_log_probs_ref = micro_infer_model(
             num_ref_dp_groups, "ref_model", sequences_all, num_actions_all, attention_mask_all, packed_seq_lens_all
-        )
+        ) if not self.cfg.disable_kl else None
         base_log_probs = None
 
         # handle colocate critic and reward model
@@ -410,7 +417,7 @@ class RayPPOTrainer:
             await self.critic_model.async_run_method("empty_cache")
 
         # handle colocate actor and ref model
-        if self.cfg.colocate_actor_ref or self.cfg.colocate_all:
+        if (self.cfg.colocate_actor_ref or self.cfg.colocate_all) and not self.cfg.disable_kl:
             base_log_probs = await base_action_log_probs_ref
             await self.ref_model.async_run_method("empty_cache")
 
@@ -434,7 +441,7 @@ class RayPPOTrainer:
         # calculate action log probs
         if self.cfg.colocate_all:
             await self.policy_model.backload_to_gpu()
-
+        
         action_log_probs_ref = micro_infer_model(
             num_policy_dp_groups,
             "policy_model",
@@ -485,22 +492,25 @@ class RayPPOTrainer:
         # 6. calculate kl divergence
 
         experiences = []
-        if self.critic_model is not None:
-            values = values[: len(sequences_all)]
-        base_log_probs = base_log_probs[: len(sequences_all)]
-        action_log_probs = action_log_probs[: len(sequences_all)]
         if r is not None:
             r = r[: len(sequences_all)]
+        action_log_probs = action_log_probs[: len(sequences_all)]
+        if base_log_probs:
+            base_log_probs = base_log_probs[: len(sequences_all)]
+
         for i in range(len(action_log_probs)):
             response_length = torch.Tensor(num_actions_all[i]).unsqueeze(0)
             total_length = torch.Tensor(packed_seq_lens_all[i]).unsqueeze(0)
-            kl = compute_approx_kl(
-                action_log_probs[i],
-                base_log_probs[i],
-                action_mask=None,
-                use_kl_estimator_k3=self.cfg.use_kl_estimator_k3,
-                use_abs_kl=self.cfg.use_abs_kl,
-            )
+            if self.cfg.disable_kl:
+                kl = torch.zeros_like(action_log_probs[i])
+            else:
+                kl = compute_approx_kl(
+                    action_log_probs[i],
+                    base_log_probs[i],
+                    action_mask=None,
+                    use_kl_estimator_k3=self.cfg.use_kl_estimator_k3,
+                    use_abs_kl=self.cfg.use_abs_kl,
+                )
             kl_max = torch.max(kl.abs(), dim=-1)[0]
             kl_mean = masked_mean(kl, None, dim=-1)
             if r is not None:
@@ -520,7 +530,7 @@ class RayPPOTrainer:
                 Experience(
                     sequences_all[i],
                     action_log_probs[i],
-                    base_log_probs[i],
+                    base_log_probs[i] if not self.cfg.disable_kl else None,
                     values[i] if self.critic_model is not None else None,
                     None,
                     None,
@@ -571,7 +581,7 @@ class RayPPOTrainer:
     async def build_models(self, PolicyRayActor, CriticRayActor, RefRayActor, RewardRayActor=None):
         cfg = self.cfg
         pg = None
-
+        # place all model in same gpus
         if cfg.colocate_all:
             assert (
                 cfg.actor_num_nodes == cfg.critic_num_nodes
@@ -583,6 +593,7 @@ class RayPPOTrainer:
             ), "num_nodes and num_gpus_per_node must be the same when colocate all models and each actor has only one gpu."
             pg = self.colocate_pg
 
+            # wrapped by actor group.
             policy_model = PPORayActorGroup(
                 cfg.actor_num_nodes,
                 cfg.actor_num_gpus_per_node,
@@ -590,13 +601,17 @@ class RayPPOTrainer:
                 pg=pg,
                 num_gpus_per_actor=0.2,
             )
-            ref_model = PPORayActorGroup(
-                cfg.ref_num_nodes,
-                cfg.ref_num_gpus_per_node,
-                RefRayActor,
-                pg=pg,
-                num_gpus_per_actor=0.2,
-            )
+            if cfg.disable_kl:
+                ref_model = None
+            else:
+                ref_model = PPORayActorGroup(
+                    cfg.ref_num_nodes,
+                    cfg.ref_num_gpus_per_node,
+                    RefRayActor,
+                    pg=pg,
+                    num_gpus_per_actor=0.2,
+                )
+            # No critic model need for GRPO.
             if cfg.critic_pretrain:
                 critic_model = PPORayActorGroup(
                     cfg.critic_num_nodes,
@@ -646,13 +661,16 @@ class RayPPOTrainer:
                 pg=pg,
                 num_gpus_per_actor=0.75 if pg else 1,
             )
-            ref_model = PPORayActorGroup(
-                cfg.ref_num_nodes,
-                cfg.ref_num_gpus_per_node,
-                RefRayActor,
-                pg=pg,
-                num_gpus_per_actor=0.25 if pg else 1,
-            )
+            if cfg.disable_kl:
+                ref_model = None
+            else:
+                ref_model = PPORayActorGroup(
+                    cfg.ref_num_nodes,
+                    cfg.ref_num_gpus_per_node,
+                    RefRayActor,
+                    pg=pg,
+                    num_gpus_per_actor=0.25 if pg else 1,
+                )
 
             # if colocated, create placement group for critic and reward model explicitly.
             pg = None
@@ -699,7 +717,8 @@ class RayPPOTrainer:
 
         if not cfg.colocate_all:
             refs = []
-            refs.extend(ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
+            if not self.cfg.disable_kl:
+                refs.extend(ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             refs.extend(policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             if cfg.critic_pretrain:
                 refs.extend(critic_model.async_init_model_from_pretrained(self.strategy, cfg.critic_pretrain))
@@ -709,7 +728,8 @@ class RayPPOTrainer:
             await asyncio.gather(*refs)
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
         else:
-            await asyncio.gather(*ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
+            if not self.cfg.disable_kl:
+                await asyncio.gather(*ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await asyncio.gather(*policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
             await policy_model.offload_to_cpu()
@@ -789,8 +809,8 @@ class RayPPOTrainer:
         experience.kl = None
 
         avg_rewards = return_sums.mean().item()
-        avg_kl = experience.info["kl"].mean().item()
-        avg_kl_max = experience.info["kl_max"].mean().item()
+        avg_kl = 0.0 if self.cfg.disable_kl else experience.info["kl"].mean().item()
+        avg_kl_max = 0.0 if self.cfg.disable_kl else experience.info["kl_max"].mean().item()
 
         avg_response_length = experience.info["response_length"].mean().item()
         if experience.info["reward"] is not None:

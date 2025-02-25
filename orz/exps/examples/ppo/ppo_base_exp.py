@@ -225,6 +225,7 @@ class BasePPOExp(BaseExp):
         )
 
         # build the models
+        # Call the trainer, so everything are initialized.
         await self.trainer.build_models(self.PolicyRayActor, self.CriticRayActor, self.RefRayActor, self.RewardRayActor)
 
         # initialize the trainer and enter the training loop
