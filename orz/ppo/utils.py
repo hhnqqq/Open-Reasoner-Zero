@@ -98,7 +98,20 @@ class Timer:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        logger.opt(depth=1).info(f"{self.message}, time cost: {time.time() - self.start_time:.2f}s")
+        elapsed_time = time.time() - self.start_time
+        hours = int(elapsed_time // 3600)
+        minutes = int((elapsed_time % 3600) // 60)
+        seconds = elapsed_time % 60
+        
+        time_str = ""
+        if hours > 0:
+            time_str = f"{hours}h {minutes}m {seconds:.2f}s"
+        elif minutes > 0:
+            time_str = f"{minutes}m {seconds:.2f}s"
+        else:
+            time_str = f"{seconds:.2f}s"
+            
+        logger.opt(depth=1).info(f"{self.message}, time cost: {time_str}")
 
 
 def _validate_args(args: DictConfig):
@@ -381,7 +394,7 @@ def create_vllm_engines(
         num_gpus = 0
         for i in range(num_engines):
             bundles = [{"GPU": 1, "CPU": 1}] * tensor_parallel_size
-            pg = placement_group(bundles, strategy="PACK")
+            pg = placement_group(bundles, strategy="SPREAD")
             ray.get(pg.ready())
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
