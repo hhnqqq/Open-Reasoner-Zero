@@ -505,7 +505,10 @@ class PolicyRayActorBase(RayActor):
         assert isinstance(experience.sequences, list)
         sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
         old_action_log_probs = torch.cat(experience.action_log_probs, dim=0).unsqueeze(0)
-        base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
+        if experience.base_action_log_probs is not None:
+            base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
+        else:
+            base_action_log_probs = None
         advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
         num_actions = torch.cat(experience.num_actions, dim=0).long().tolist()
         packed_seq_lens = torch.cat(experience.packed_seq_lens, dim=0).long().tolist()
@@ -568,7 +571,7 @@ class PolicyRayActorBase(RayActor):
             entropy = entropy_sum / total_tokens
 
         # kl loss
-        if self.args.use_kl_loss:
+        if self.args.use_kl_loss and not self.args.disable_kl:
             kl_loss = action_log_probs - base_action_log_probs
             if self.args.use_kl_estimator_k3:
                 kl_loss = -kl_loss
@@ -639,11 +642,11 @@ class PolicyRayActorBase(RayActor):
             # https://github.com/OpenRLHF/OpenRLHF/issues/313
             import vllm
 
-            if vllm.__version__ > "0.4.2" and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
-                backend = "gloo"
-                self.strategy.print(
-                    "WARNING:using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
-                )
+            # if vllm.__version__ > "0.4.2" and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
+            #     backend = "gloo"
+            #     self.strategy.print(
+            #         "WARNING:using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
+            #     )
 
             refs = [
                 engine.init_process_group.remote(
@@ -977,7 +980,7 @@ class RefRayActorBase(RayActor):
             )
         return log_probs.to("cpu")
 
-
+# allocate one gpu for this model
 PolicyRayActor = ray.remote(num_gpus=1)(PolicyRayActorBase)
 CriticRayActor = ray.remote(num_gpus=1)(CriticRayActorBase)
 RewardRayActor = ray.remote(num_gpus=1)(RewardRayActorBase)

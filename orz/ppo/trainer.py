@@ -1,5 +1,6 @@
 import asyncio
 import json
+import wandb
 import math
 import os
 import random
@@ -13,7 +14,6 @@ from loguru import logger
 from omegaconf.dictconfig import DictConfig
 from ray.util.placement_group import PlacementGroup, placement_group
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from orz.ppo.actors import PPORayActorGroup
@@ -49,7 +49,6 @@ class RayPPOTrainer:
         self.prompts_dataloader = self.build_dataloader(train_dataset)
         self.colocate_pg = colocate_pg
 
-        self.writer = SummaryWriter(log_dir=self.cfg.tensorboard_log_dir)
         self.replay_buffer = NaiveReplayBuffer(
             sample_batch_size=self.cfg.micro_train_batch_size,
             limit=0,
@@ -57,14 +56,12 @@ class RayPPOTrainer:
             packing_samples=True,
         )
 
-    def __del__(self):
-        self.writer.close()
 
     async def eval(self):
         raise NotImplementedError("Eval function should be implemented in user's exp")
 
     async def train(self):
-        # 1. create rank0 policy model and vllm_engines groups, then boardcast weights to vllm engins
+        # 1. create rank 0 policy model and vllm_engines groups, then boardcast weights to vllm engines
         if self.cfg.colocate_all:
             await self.policy_model.backload_to_gpu()
             await self._backload_vllm_engines()
@@ -81,6 +78,9 @@ class RayPPOTrainer:
 
         # 2. main training loop
         consumed_samples = 0
+        # num_update_steps_per_episodes * train_batch_size = num_samples_per_episodes * epochs
+        # num_samples_per_episodes // n_samples_per_prompt = num_prompts_per_episodes * epochs
+        # num_prompts_per_episodes // rollout_bsz = num_rollout
         num_rollouts_per_episodes = (
             self.num_update_steps_per_episodes
             * self.cfg.train_batch_size
@@ -119,17 +119,6 @@ class RayPPOTrainer:
 
                 if self.cfg.advantage_normalize:
                     self.replay_buffer = normalize_advantages(self.replay_buffer)
-
-                # serialize replay buffer to jsonl
-                # Record each replay.
-                async with Timer("Dumping replay buffer"):
-                    all_replay_buffer_save_path = os.path.join(self.cfg.save_path, "dumped_replay_buffer")
-                    os.makedirs(all_replay_buffer_save_path, exist_ok=True)
-                    dump_path = os.path.join(all_replay_buffer_save_path, f"iter{self.global_step}_replay_buffer.jsonl")
-                    with open(dump_path, "a") as f:
-                        logger.info(f"dumping replay buffer to {dump_path}")
-                        for item in self.replay_buffer:
-                            f.write(json.dumps(item.to_json()) + "\n")
 
                 # How many actor data parallel ranks
                 num_policy_dp_nodes = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
@@ -176,7 +165,7 @@ class RayPPOTrainer:
                 logger.info(status)
                 pbar.update()
                 # log epoch info
-                self.writer.add_scalar("episode_idx", episode, self.global_step)
+                wandb.log({"episode_idx":episode}, step=self.global_step)
                 self.global_step += 1
                 if self.global_step % self.cfg.save_interval == 0:
                     await self.policy_model.async_save_model(self.tokenizer, self.global_step)
@@ -226,6 +215,7 @@ class RayPPOTrainer:
                 if len(dp_inputs) <= 0:
                     continue
                 gen_func = self._get_generate_function(dp_rank)
+                generate_kwargs['use_tqdm'] = True if dp_rank == 0 else False
                 dp_tasks.append(self.generate_vllm(gen_func, dp_inputs, extras=dp_extras, **generate_kwargs))
 
             logger.info("start generation")
@@ -278,19 +268,19 @@ class RayPPOTrainer:
         # 1.4 inference and calculate values, log probs, rewards, kl divergence
         async with Timer("Inference and calculate values, log probs, rewards, kl divergence"):
             experiences = await self.inference_and_calculates(
-                ret_sequences,
-                ret_attention_masks,
-                action_masks,
-                ret_num_actions,
-                ret_packed_seq_lens,
-                ret_custom_rewards,
+                sequences_all=ret_sequences,
+                attention_mask_all=ret_attention_masks,
+                action_mask_all=action_masks,
+                num_actions_all=ret_num_actions,
+                packed_seq_lens_all=ret_packed_seq_lens,
+                custom_rewards_all=ret_custom_rewards,
             )
+            # How many packed sequecnes. rollout_bsz * n_samples_per_prompt -> packed
             logger.info(f"experiences size: {len(experiences)}")
 
-        # 2. visualization generated results example
-        vis = self._detokenize(experiences[0].sequences[0][: int(experiences[0].info["total_length"].flatten()[0])])
-        self.writer.add_text("generated_sequences", vis, self.global_step)
-        self.writer.flush()
+        # 2. log generated results example
+        # vis = self._detokenize(experiences[0].sequences[0][: int(experiences[0].info["total_length"].flatten()[0])])
+        # wandb.log({"generated_sequences": wandb.Table(columns=["序列"], data=[[vis]])}, step=self.global_step)
 
         # 3. calculate advantages and returns / along with tensorboard logging
         avg_rewards = 0
@@ -319,19 +309,25 @@ class RayPPOTrainer:
                 avg_advantages_abs += metrics["avg_advantages_abs"]
                 self.replay_buffer.append(experience)
 
-        # 4. tensorboard logging
+        # 4. wandb logging
         logger.info(
             f"avg_raw_rewards: {avg_rewards / len(experiences)}, avg_kl: {avg_kl / len(experiences)}, avg_response_length: {avg_response_length / len(experiences)}, avg_orm_score: {avg_orm_score / len(experiences)}, avg_custom_rewards: {avg_custom_rewards / len(experiences)}"
         )
-        self.writer.add_scalar("avg_raw_rewards", avg_rewards / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_kl", avg_kl / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_kl_max", avg_kl_max / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_response_length", avg_response_length / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_orm_score", avg_orm_score / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_custom_rewards", avg_custom_rewards / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_raw_advantages", avg_advantages / len(experiences), self.global_step)
-        self.writer.add_scalar("avg_raw_advantages_abs", avg_advantages_abs / len(experiences), self.global_step)
-        self.writer.flush()
+
+        log_data = {
+            "avg_raw_rewards": avg_rewards / len(experiences),
+            "avg_response_length": avg_response_length / len(experiences),
+            "avg_custom_rewards": avg_custom_rewards / len(experiences),
+            "avg_raw_advantages": avg_advantages / len(experiences),
+            "avg_raw_advantages_abs": avg_advantages_abs / len(experiences),
+        }
+        if self.cfg.use_orm_score:
+            log_data["avg_orm_score"] = avg_orm_score / len(experiences)
+        if not self.cfg.disable_kl:
+            log_data["avg_kl"] = avg_kl / len(experiences)
+            log_data["avg_kl_max"] = avg_kl_max / len(experiences)
+
+        wandb.log(log_data, step=self.global_step)
 
     @torch.no_grad()
     async def inference_and_calculates(
@@ -343,7 +339,7 @@ class RayPPOTrainer:
         packed_seq_lens_all: Optional[List[int]],
         custom_rewards_all: Optional[List[torch.Tensor]],
     ):
-        # How many gpus each model takes. 
+        # How many gpus each model takes.
         num_policy_dp_groups = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
         num_critic_dp_groups = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
         num_ref_dp_groups = self.cfg.ref_num_nodes * self.cfg.ref_num_gpus_per_node
@@ -503,7 +499,7 @@ class RayPPOTrainer:
             total_length = torch.Tensor(packed_seq_lens_all[i]).unsqueeze(0)
             if self.cfg.disable_kl:
                 kl = torch.zeros_like(action_log_probs[i])
-            else:
+            elif base_log_probs:
                 kl = compute_approx_kl(
                     action_log_probs[i],
                     base_log_probs[i],
@@ -511,6 +507,8 @@ class RayPPOTrainer:
                     use_kl_estimator_k3=self.cfg.use_kl_estimator_k3,
                     use_abs_kl=self.cfg.use_abs_kl,
                 )
+            else:
+                raise ValueError('Base model log probs are needed for kl computation.')
             kl_max = torch.max(kl.abs(), dim=-1)[0]
             kl_mean = masked_mean(kl, None, dim=-1)
             if r is not None:
@@ -530,7 +528,7 @@ class RayPPOTrainer:
                 Experience(
                     sequences_all[i],
                     action_log_probs[i],
-                    base_log_probs[i] if not self.cfg.disable_kl else None,
+                    base_log_probs[i] if base_log_probs else None,
                     values[i] if self.critic_model is not None else None,
                     None,
                     None,
@@ -571,6 +569,8 @@ class RayPPOTrainer:
         prompts_dataloader = DataLoader(
             dataset, batch_size=self.cfg.rollout_batch_size, shuffle=True, collate_fn=dataset.collate_fn, num_workers=8
         )
+        # len(dataset): number of batches
+        # len(dataset) * self.cfg.n_samples_per_prompt: number of batches with repeat
         self.num_update_steps_per_episodes = (
             len(dataset) * self.cfg.n_samples_per_prompt // self.cfg.train_batch_size * self.cfg.max_epochs
         )
@@ -579,6 +579,7 @@ class RayPPOTrainer:
         return prompts_dataloader
 
     async def build_models(self, PolicyRayActor, CriticRayActor, RefRayActor, RewardRayActor=None):
+        logger.info("start init policy/ref/critic/reward models")
         cfg = self.cfg
         pg = None
         # place all model in same gpus
@@ -602,6 +603,7 @@ class RayPPOTrainer:
                 num_gpus_per_actor=0.2,
             )
             if cfg.disable_kl:
+                # Do not need ref_model
                 ref_model = None
             else:
                 ref_model = PPORayActorGroup(
@@ -717,7 +719,7 @@ class RayPPOTrainer:
 
         if not cfg.colocate_all:
             refs = []
-            if not self.cfg.disable_kl:
+            if ref_model:
                 refs.extend(ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             refs.extend(policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             if cfg.critic_pretrain:
@@ -728,7 +730,7 @@ class RayPPOTrainer:
             await asyncio.gather(*refs)
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
         else:
-            if not self.cfg.disable_kl:
+            if ref_model:
                 await asyncio.gather(*ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await asyncio.gather(*policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
@@ -751,9 +753,10 @@ class RayPPOTrainer:
         if global_steps > self.cfg.freezing_actor_steps:
             async with Timer("Policy model training"):
                 status = await self.policy_model.async_ppo_train(global_steps, replay_buffers)
-            self.writer.add_scalar("ppo_clip_count", status[0]["clip_ratio"], global_steps)
-            self.writer.add_scalar("policy_update_steps", status[0]["policy_update_steps"], global_steps)
-            self.writer.add_scalar("policy_entropy", status[0]["entropy"], global_steps)
+            wandb.log({"ppo_clip_count": status[0]["clip_ratio"],
+                       "policy_update_steps": status[0]["policy_update_steps"],
+                       "policy_entropy": status[0]["entropy"]},
+                       step=global_steps)
             await self.policy_model.async_run_method("empty_cache")
         if self.cfg.colocate_all:
             async with Timer("Backload vllm engines to gpu"):
@@ -768,8 +771,9 @@ class RayPPOTrainer:
         async with Timer("Critic model training"):
             status = await self.critic_model.async_ppo_train(global_steps, replay_buffers)
         if critic_loss := status[0].get("critic_loss", None):
-            self.writer.add_scalar("critic_loss", critic_loss, global_steps)
-            self.writer.add_scalar("critic_update_steps", status[0]["critic_update_steps"], global_steps)
+            wandb.log({"critic_loss": critic_loss,
+                       "critic_update_steps": status[0]["critic_update_steps"]},
+                       step=global_steps)
         return status[0]
 
     async def custom_reward_fn(
@@ -809,8 +813,8 @@ class RayPPOTrainer:
         experience.kl = None
 
         avg_rewards = return_sums.mean().item()
-        avg_kl = 0.0 if self.cfg.disable_kl else experience.info["kl"].mean().item()
-        avg_kl_max = 0.0 if self.cfg.disable_kl else experience.info["kl_max"].mean().item()
+        avg_kl = experience.info["kl"].mean().item()
+        avg_kl_max = experience.info["kl_max"].mean().item()
 
         avg_response_length = experience.info["response_length"].mean().item()
         if experience.info["reward"] is not None:
@@ -1191,15 +1195,12 @@ class RayPPOTrainer:
             else:
                 prompt_token_ids = self._tokenize(prompts, padding=False)["input_ids"]
             outputs = await llm.generate.remote(prompt_token_ids=prompt_token_ids, **kwargs)
-            responses = []
+            num_prompts = len(prompts)
+            responses = [outputs[i].outputs[0].text for i in range(num_prompts)]
+            finish_reasons = [outputs[i].outputs[0].finish_reason for i in range(num_prompts)]
+            # prompt_logprobs = [outputs[i].prompt_logprobs for i in range(num_prompts) if outputs[i].prompt_logprobs]
             prompt_logprobs = []
-            finish_reasons = []
-            for i, prompt in enumerate(prompts):
-                content = outputs[i].outputs[0].text
-                finish_reasons.append(outputs[i].outputs[0].finish_reason)
-                responses.append(content)
-                if outputs[i].prompt_logprobs:
-                    prompt_logprobs.append(outputs[i].prompt_logprobs)
+
             if len(prompt_logprobs) > 0:
                 return (
                     responses,
@@ -1231,24 +1232,23 @@ class RayPPOTrainer:
         return sequences, attention_mask, action_mask
 
     def _tokenize(self, texts, max_length=99999999, padding=True, device=None):
-        if not padding:
-            # when padding is False, return tokenized texts as list
-            return self.tokenizer(
+            if not padding:
+                # when padding is False, return tokenized texts as list
+                return self.tokenizer(
+                    texts,
+                    add_special_tokens=False,
+                    max_length=max_length,
+                    truncation=True,
+                )
+            batch = self.tokenizer(
                 texts,
+                return_tensors="pt",
                 add_special_tokens=False,
                 max_length=max_length,
+                padding=True,
                 truncation=True,
             )
-        batch = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            add_special_tokens=False,
-            max_length=max_length,
-            padding=True,
-            truncation=True,
-        )
-        return {k: v.to(device) for k, v in batch.items()}
-
+            return {k: v.to(device) for k, v in batch.items()}
     def _detokenize(self, token_ids):
         return self.tokenizer.decode(token_ids, skip_special_tokens=False)
 
