@@ -38,7 +38,8 @@ class LLMActor:
 
                 RayWorkerWrapperPath.RayWorkerWrapper = RayWorkerWrapper
 
-        kwargs["enforce_eager"] = True
+        kwargs["enforce_eager"] = False
+        kwargs["enable_sleep_mode"] = True
         self.llm = vllm.LLM(*args, **kwargs)
         self.scheduler_config = self.llm.llm_engine.scheduler_config
         self.model_config = self.llm.llm_engine.model_config
@@ -66,27 +67,10 @@ class LLMActor:
             return self.llm.llm_engine.model_executor._run_workers("get_ip_and_port")
 
     def offload_to_cpu(self):
-        if self.use_gpu_executor:
-            return self.llm.llm_engine.model_executor.driver_worker.offload_cpu()
-        else:
-            return self.llm.llm_engine.model_executor._run_workers("offload_cpu")
+        self.llm.sleep()
 
     def backload_to_gpu(self):
-        if self.use_gpu_executor:
-            self.llm.llm_engine.model_executor.driver_worker.load_gpu()
-        else:
-            self.llm.llm_engine.model_executor._run_workers("load_gpu")
-        # rebuild scheduler
-        self.llm.llm_engine.scheduler = [
-            Scheduler(
-                self.scheduler_config,
-                self.cache_config,
-                self.lora_config,
-                self.parallel_config.pipeline_parallel_size,
-                self.async_callbacks[v_id] if self.model_config.use_async_output_proc else None,
-            )
-            for v_id in range(self.parallel_config.pipeline_parallel_size)
-        ]
+        self.llm.wake_up()
 
     def update_weight(self, name, dtype, shape, empty_cache=False):
         self.stop_remote_worker_execution_loop()
