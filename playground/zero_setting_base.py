@@ -28,7 +28,9 @@ Problem: {{prompt}}
                                                     tokenize=False,
                                                     add_generation_prompt=True)
         # A lot of solutions are None.
-        extra = {"answer": dialogue["answer"], "solution": dialogue["solution"] if "solution" in dialogue.keys() else " "}
+        extra = {"answer": dialogue["answer"], 
+                 "solution": dialogue["solution"] if "solution" in dialogue.keys() else " ",
+                 "file_name": dialogue["file_name"]}
 
         return prompt, extra
 
