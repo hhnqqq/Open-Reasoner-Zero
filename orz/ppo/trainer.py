@@ -53,7 +53,8 @@ class RayPPOTrainer:
         self.colocate_pg = colocate_pg
 
         self.replay_buffer = NaiveReplayBuffer(
-            sample_batch_size=self.cfg.micro_train_batch_size,
+            actor_sample_batch_size=self.cfg.actor_micro_train_batch_size,
+            critic_sample_batch_size=self.cfg.critic_micro_train_batch_size,
             limit=0,
             cpu_offload=True,
             packing_samples=True,
@@ -145,7 +146,7 @@ class RayPPOTrainer:
                         await self.policy_model.backload_to_gpu()
                         status = await self.ppo_local_train_policy(policy_buffers, self.global_step)
                         await self.policy_model.offload_to_cpu()
-
+                        
                 else:
                     if self.critic_model is not None:
                         async with Timer("Actor and Critic model training"):
@@ -379,6 +380,7 @@ class RayPPOTrainer:
                         partial(forward_fn, model),
                         (micro_sequences, micro_num_actions, micro_attention_mask, micro_packed_seq_lens),
                         self.cfg.micro_forward_batch_size,
+                        dp_rank if model_type == 'policy_model' else -1
                     )
                 )
             results = await asyncio.gather(*dp_tasks)
@@ -1182,12 +1184,12 @@ class RayPPOTrainer:
 
         return result
 
-    async def _split_and_run_micro_batch(self, async_fn, batch_args, micro_size):
+    async def _split_and_run_micro_batch(self, async_fn, batch_args, micro_size, rank=-1):
         # Ensure batch_args is a sequence of lists with equal length
         batch_size = len(batch_args[0])
         results = []
         # Process in micro batches
-        for i in range(0, batch_size, micro_size):
+        for i in tqdm(range(0, batch_size, micro_size), disable=(rank != 0), desc='Inferencing'):
             # Take slice i:i+micro_size from each argument
             micro_batch_args = []
             for arg in batch_args:
@@ -1299,7 +1301,7 @@ class RayPPOTrainer:
                         self._split_and_run_micro_batch(
                             partial(_rm_run, rm),
                             args,
-                            self.cfg.micro_forward_batch_size,
+                            self.cfg.micro_forward_batch_size
                         )
                     )
                 outputs = await asyncio.gather(*dp_tasks)

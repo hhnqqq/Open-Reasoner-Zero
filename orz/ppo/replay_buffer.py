@@ -267,16 +267,23 @@ class NaiveReplayBuffer(ABC):
     """Naive replay buffer class. It stores experience.
 
     Args:
-        sample_batch_size (int): Batch size when sampling.
+        actor_sample_batch_size (int): Actor batch size when sampling.
+        critic_sample_batch_size (int): Critic batch size when sampling.
         limit (int, optional): Limit of number of experience samples. A number <= 0 means unlimited. Defaults to 0.
         cpu_offload (bool, optional): Whether to offload experience to cpu when sampling. Defaults to True.
     """
 
     def __init__(
-        self, sample_batch_size: int, limit: int = 0, cpu_offload: bool = True, packing_samples: bool = False
+        self, 
+        actor_sample_batch_size: int, 
+        critic_sample_batch_size: int,
+        limit: int = 0, 
+        cpu_offload: bool = True, 
+        packing_samples: bool = False
     ) -> None:
         super().__init__()
-        self.sample_batch_size = sample_batch_size
+        self.actor_sample_batch_size = actor_sample_batch_size
+        self.critic_sample_batch_size = critic_sample_batch_size
         # limit <= 0 means unlimited
         self.limit = limit
         self.cpu_offload = cpu_offload
@@ -301,7 +308,8 @@ class NaiveReplayBuffer(ABC):
         random.shuffle(items)
         for i in range(n_batches):
             bf = NaiveReplayBuffer(
-                sample_batch_size=self.sample_batch_size,
+                actor_sample_batch_size=self.actor_sample_batch_size,
+                critic_sample_batch_size=self.critic_sample_batch_size,
                 limit=self.limit,
                 cpu_offload=self.cpu_offload,
                 packing_samples=self.packing_samples,
@@ -328,8 +336,9 @@ class NaiveReplayBuffer(ABC):
         self.items.clear()
 
     @torch.no_grad()
-    def sample(self) -> Experience:
-        items = random.sample(self.items, self.sample_batch_size)
+    def sample(self, sample_size: Optional[int]=None) -> Experience:
+        sample_size = self.actor_sample_batch_size if sample_size is None else sample_size
+        items = random.sample(self.items, sample_size)
         experience = make_experience_batch(items, self.packing_samples)
         if self.cpu_offload:
             experience.to_device(self.target_device)

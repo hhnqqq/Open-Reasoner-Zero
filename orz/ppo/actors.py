@@ -426,7 +426,7 @@ class PolicyRayActorBase(RayActor):
         device = torch.cuda.current_device()
         dataloader = DataLoader(
             replay_buffer,
-            batch_size=replay_buffer.sample_batch_size,
+            batch_size=replay_buffer.actor_sample_batch_size,
             drop_last=False,
             collate_fn=replay_buffer.collate_fn,
             pin_memory=False,
@@ -827,7 +827,7 @@ class CriticRayActorBase(RayActor):
 
         dataloader = DataLoader(
             replay_buffer,
-            batch_size=replay_buffer.sample_batch_size,
+            batch_size=replay_buffer.critic_sample_batch_size,
             shuffle=True,
             drop_last=False,
             pin_memory=False,
