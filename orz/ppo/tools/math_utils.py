@@ -1,5 +1,7 @@
 import asyncio
 import re
+from openai import OpenAI
+from open_r1.utils import call_gpt
 from itertools import islice, zip_longest
 
 from sympy.parsing.latex import parse_latex
@@ -404,24 +406,81 @@ def remove_boxed(s):
         return None
 
 
-def get_answer_str(s: str) -> str:
+def get_answer_str(s: str, return_origin=False) -> str:
     res = remove_boxed(last_boxed_only_string(s))
     if res is not None:
         return res
-    return s
+    if return_origin:
+        return s
+    else:
+        return None
 
+async def is_llm_equal(problem, predict, label):
+    client = OpenAI(api_key="Yzg1ZjJhZjZiYTcyM2JmOTQyOWQwYzcwY2NhYWI4YzM3YzY4NjlhOA==",
+                    base_url="http://1761768484581117.cn-wulanchabu.pai-eas.aliyuncs.com/api/predict/qwen_2_5_32b_instruct/v1")
+    
+    
+    prompt = f'''
+Given a problem, verify whether the final answer in the model output is consistent with the standard answer. 
+Consistency includes exact equality or mathematical equivalence (e.g., 0.333 = 1/3, fractions in simplest form, or equivalent expressions).
+Return 1 if consistent, otherwise return 0.
+Note that you do not output anything except the score.
+problem:
+{problem}
 
-async def is_equal(str1, str2, executor, math_mode="legacy"):
+Standard answer:
+{label}
+
+Model output:
+{predict}
+
+Your judgement:
+'''
+    result = call_gpt(prompt=prompt, 
+                      client=client, 
+                      max_tokens=4096, 
+                      model='Qwen2.5-32b-Instruct',
+                      temperature=0.0001)
+    try:
+        reward = float(re.search(r'\d', result).group(0))
+    except:
+        reward = 0.0
+    return reward != 0.0
+
+async def is_equal(str1, 
+                   str2, 
+                   executor, 
+                   prompt, 
+                   answer_cannot_parsed, 
+                   use_llm=False, 
+                   use_full_answer=False, 
+                   math_mode="legacy"):
     first_equal = is_equiv(str1, str2)
     if first_equal:
         return True
-    return await is_latex_equal(str1, str2, executor, math_mode)
+    latex_equal = await is_latex_equal(str1, str2, executor, math_mode)
+    if latex_equal:
+        return True
+    if use_llm:
+        try:
+            if str1 and str2 and prompt:
+                llm_equal = await is_llm_equal(prompt, str2, str1)
+            elif use_full_answer and str1 and prompt and answer_cannot_parsed:
+                llm_equal = await is_llm_equal(prompt, answer_cannot_parsed, str1)
+            else:
+                llm_equal = False
+        except:
+            llm_equal = False
+        return llm_equal
+    else:
+        return False
+    
 
 
-def solution2answer(solution: str, math_mode="eval_peeking") -> str:
+def solution2answer(solution: str, math_mode="eval_peeking", return_origin=True) -> str:
     answer = solution
     if math_mode == "eval_peeking":
-        answer = get_answer_str(solution)
+        answer = get_answer_str(solution, return_origin)
     else:
         raise ValueError(f"Invalid math_mode: {math_mode}")
     return answer

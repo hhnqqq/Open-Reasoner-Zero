@@ -123,9 +123,6 @@ def _validate_args(args: DictConfig):
     assert (
         args.packing_max_len >= args.prompt_max_len + args.generate_max_len
     ), "packing_max_len should be set greater than prompt_max_len + generate_max_len when packing samples is True"
-    assert (
-        args.micro_forward_batch_size == 1 and args.micro_train_batch_size == 1
-    ), "micro_forward_batch_size and micro_train_batch_size should be 1 when packing samples is True"
 
 
 def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None) -> torch.Tensor:

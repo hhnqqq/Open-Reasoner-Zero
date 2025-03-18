@@ -1,20 +1,23 @@
-import asyncio
-import json
-import wandb
-import math
 import os
+import math
 import random
+import asyncio
+
 from functools import partial
 from heapq import heapify, heappop, heappush
 from typing import Any, Awaitable, Callable, List, Optional, Tuple, Union
 
 import ray
+import wandb
 import torch
-from loguru import logger
-from omegaconf.dictconfig import DictConfig
-from ray.util.placement_group import PlacementGroup, placement_group
-from torch.utils.data import DataLoader
+
 from tqdm import tqdm
+from loguru import logger
+from itertools import chain
+from torch.utils.data import DataLoader
+from omegaconf.dictconfig import DictConfig
+from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+from ray.util.placement_group import PlacementGroup, placement_group
 
 from orz.ppo.actors import PPORayActorGroup
 from orz.ppo.replay_buffer import Experience, NaiveReplayBuffer
@@ -124,6 +127,7 @@ class RayPPOTrainer:
                 num_policy_dp_nodes = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
                 # How many critic data parallel ranks
                 num_critic_dp_nodes = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
+                # Acquire replay buffer per rank.
                 policy_buffers = self.replay_buffer.split_to_n_batches(num_policy_dp_nodes)
                 if num_policy_dp_nodes != num_critic_dp_nodes:
                     critic_buffers = self.replay_buffer.split_to_n_batches(num_critic_dp_nodes)
@@ -253,6 +257,8 @@ class RayPPOTrainer:
 
         # 1.3 packing samples
         # Pack all prompts and outputs together.
+        # Example ret_sequences [1,1,1,2,2,2,2,0,0,0]
+        # Example num_actions [[1,2]]
         async with Timer("Packing samples"):
             (
                 ret_sequences,
@@ -368,7 +374,6 @@ class RayPPOTrainer:
                         attention_mask=fwd_attention_mask,
                         packed_seq_lens=fwd_packed_seq_lens,
                     )
-
                 dp_tasks.append(
                     self._split_and_run_micro_batch(
                         partial(forward_fn, model),
@@ -399,6 +404,7 @@ class RayPPOTrainer:
             values = None
             if self.cfg.colocate_all:
                 values = await value_ref
+                values = list(chain(*values))
                 await self.critic_model.offload_to_cpu()
 
         # calculate ref log probs
@@ -415,6 +421,7 @@ class RayPPOTrainer:
         # handle colocate actor and ref model
         if (self.cfg.colocate_actor_ref or self.cfg.colocate_all) and not self.cfg.disable_kl:
             base_log_probs = await base_action_log_probs_ref
+            base_log_probs = list(chain(*base_log_probs))
             await self.ref_model.async_run_method("empty_cache")
 
         # calculate rewards
@@ -449,6 +456,7 @@ class RayPPOTrainer:
         action_log_probs = None
         if self.cfg.colocate_all:
             action_log_probs = await action_log_probs_ref
+            action_log_probs = list(chain(*action_log_probs))
             await self.policy_model.offload_to_cpu()
 
         # wait all models done
@@ -461,17 +469,17 @@ class RayPPOTrainer:
                     results = await asyncio.gather(
                         value_ref, base_action_log_probs_ref, action_log_probs_ref, *reward_refs
                     )
-                    values, base_log_probs, action_log_probs, rewards = results[0], results[1], results[2], results[3:]
+                    values, base_log_probs, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), list(chain(*results[2])), results[3:]
                 else:
                     results = await asyncio.gather(base_action_log_probs_ref, action_log_probs_ref, *reward_refs)
-                    base_log_probs, action_log_probs, rewards = results[0], results[1], results[2:]
+                    base_log_probs, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), results[2:]
             else:
                 if not self.cfg.colocate_critic_reward and self.critic_model is not None:
                     results = await asyncio.gather(value_ref, action_log_probs_ref, *reward_refs)
-                    values, action_log_probs, rewards = results[0], results[1], results[2:]
+                    values, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), results[2:]
                 else:
                     results = await asyncio.gather(action_log_probs_ref, *reward_refs)
-                    action_log_probs, rewards = results[0], results[1:]
+                    action_log_probs, rewards = list(chain(*results[0])), results[1:]
 
         r = torch.stack(rewards).sum(dim=0) if len(rewards) > 0 else None
         if not self.cfg.colocate_all:
@@ -486,10 +494,10 @@ class RayPPOTrainer:
             await asyncio.gather(*empty_cache_tasks)
 
         # 6. calculate kl divergence
-
         experiences = []
         if r is not None:
             r = r[: len(sequences_all)]
+
         action_log_probs = action_log_probs[: len(sequences_all)]
         if base_log_probs:
             base_log_probs = base_log_probs[: len(sequences_all)]
@@ -526,18 +534,18 @@ class RayPPOTrainer:
             }
             experiences.append(
                 Experience(
-                    sequences_all[i],
-                    action_log_probs[i],
-                    base_log_probs[i] if base_log_probs else None,
-                    values[i] if self.critic_model is not None else None,
-                    None,
-                    None,
-                    attention_mask_all[i],
-                    None,
-                    response_length,
-                    torch.Tensor(packed_seq_lens_all[i]).unsqueeze(0),
-                    info,
-                    kl,
+                    sequences=sequences_all[i].unsqueeze(0),
+                    action_log_probs=action_log_probs[i],
+                    base_action_log_probs=base_log_probs[i] if base_log_probs else None,
+                    values=values[i] if self.critic_model is not None else None,
+                    returns=None,
+                    advantages=None,
+                    attention_mask=attention_mask_all[i].unsqueeze(0),
+                    action_mask=None,
+                    num_actions=response_length,
+                    packed_seq_lens=torch.Tensor(packed_seq_lens_all[i]).unsqueeze(0),
+                    info=info,
+                    kl=kl,
                 )
             )
         return experiences
@@ -583,6 +591,16 @@ class RayPPOTrainer:
         cfg = self.cfg
         pg = None
         # place all model in same gpus
+
+        if cfg.apply_liger:
+            apply_liger_kernel_to_qwen2(
+            rope=True,
+            swiglu=True,
+            cross_entropy=False,
+            fused_linear_cross_entropy=True,
+            rms_norm=True
+            )
+
         if cfg.colocate_all:
             assert (
                 cfg.actor_num_nodes == cfg.critic_num_nodes
@@ -761,8 +779,8 @@ class RayPPOTrainer:
         if self.cfg.colocate_all:
             async with Timer("Backload vllm engines to gpu"):
                 await self._backload_vllm_engines()
-            async with Timer("Broadcast actor weights to vllm engines"):
-                await self._sync_policy_weights_to_vllm()
+        async with Timer("Broadcast actor weights to vllm engines"):
+            await self._sync_policy_weights_to_vllm()
 
         if global_steps > self.cfg.freezing_actor_steps:
             return status[0]
@@ -924,8 +942,8 @@ class RayPPOTrainer:
         ), "prompts and outputs must have the same length and length must be greater than 0"
 
         def _new_instance():
-            out_sequence = torch.full((packing_max_len,), torch.tensor(self.tokenizer.pad_token_id), dtype=torch.long)
-            out_attention_mask = torch.zeros((packing_max_len,), dtype=torch.int)
+            out_sequence = torch.full((packing_max_len, ), torch.tensor(self.tokenizer.pad_token_id), dtype=torch.long)
+            out_attention_mask = torch.zeros((packing_max_len, ), dtype=torch.int)
             out_num_actions = []
             out_packed_seq_lens = []
             rewards = [] if custom_rewards else None
@@ -1023,9 +1041,8 @@ class RayPPOTrainer:
                     custom_rewards,
                     i,
                 )
-                valid_size = out_attention_mask.nonzero().size(0)
-                ret_sequences.append(out_sequence[:valid_size].unsqueeze(0))
-                ret_attention_masks.append(out_attention_mask[:valid_size].unsqueeze(0))
+                ret_sequences.append(out_sequence)
+                ret_attention_masks.append(out_attention_mask)
                 ret_num_actions.append(out_num_actions)
                 ret_packed_seq_lens.append(out_packed_seq_lens)
                 if custom_rewards:
@@ -1041,9 +1058,9 @@ class RayPPOTrainer:
                 ) = _new_instance()
             elif seq_offset + total_len > packing_max_len:
                 if seq_offset > 0:
-                    valid_size = out_attention_mask.nonzero().size(0)
-                    ret_sequences.append(out_sequence[:valid_size].unsqueeze(0))
-                    ret_attention_masks.append(out_attention_mask[:valid_size].unsqueeze(0))
+                    out_attention_mask[seq_offset:] = seq_index + 1
+                    ret_sequences.append(out_sequence)
+                    ret_attention_masks.append(out_attention_mask)
                     ret_num_actions.append(out_num_actions)
                     ret_packed_seq_lens.append(out_packed_seq_lens)
                     if custom_rewards:
@@ -1074,9 +1091,9 @@ class RayPPOTrainer:
                     )
 
         if seq_offset > 0:
-            valid_size = out_attention_mask.nonzero().size(0)
-            ret_sequences.append(out_sequence[:valid_size].unsqueeze(0))
-            ret_attention_masks.append(out_attention_mask[:valid_size].unsqueeze(0))
+            ret_sequences.append(out_sequence)
+            out_attention_mask[seq_offset:] = seq_index + 1
+            ret_attention_masks.append(out_attention_mask)
             ret_num_actions.append(out_num_actions)
             ret_packed_seq_lens.append(out_packed_seq_lens)
             if custom_rewards:
@@ -1177,13 +1194,14 @@ class RayPPOTrainer:
                 if arg is not None:
                     if not isinstance(arg, torch.Tensor) and not isinstance(arg, list):
                         micro_batch_args.append(arg)
-                    elif micro_size > 1 or isinstance(arg, torch.Tensor):
-                        micro_batch_args.append(arg[i : i + micro_size])
+                    elif isinstance(arg, list) and isinstance(arg[0], torch.Tensor):
+                            micro_batch_args.append(torch.stack(arg[i : i + micro_size]))
                     else:
-                        micro_batch_args.append(arg[i])
+                        micro_batch_args.append(arg[i : i + micro_size])
                 else:
                     micro_batch_args.append(None)
             results.append(await async_fn(*micro_batch_args))
+        # List[List[Tensor]]
         return results
 
     def _get_generate_function(self, dp_rank: int):

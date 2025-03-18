@@ -1,9 +1,9 @@
-import asyncio
-import logging
 import os
 import socket
+import asyncio
+import logging
+from typing import Dict, Optional, Type, Union, List
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
-from typing import Dict, Optional, Type, Union
 
 import deepspeed
 import ray
@@ -94,6 +94,7 @@ class ValueLoss(nn.Module):
         returns: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
         if self.clip_eps is not None:
             values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps)
             surr1 = (values_clipped - returns) ** 2
@@ -406,11 +407,11 @@ class PolicyRayActorBase(RayActor):
 
     def forward(
         self, sequences, num_actions, attention_mask, return_output=False, ring_attn_group=None, packed_seq_lens=None
-    ):
+    ) -> List[torch.Tensor]:
         device = torch.cuda.current_device()
         self.model.eval()
         with torch.no_grad():
-            policy_logprob = self.model(
+            policy_logprobs = self.model(
                 sequences.to(device),
                 num_actions,
                 attention_mask.to(device),
@@ -418,7 +419,7 @@ class PolicyRayActorBase(RayActor):
                 ring_attn_group,
                 packed_seq_lens,
             )
-        return policy_logprob.to("cpu")
+        return [policy_logprob.to("cpu") for policy_logprob in policy_logprobs]
 
     def ppo_train(self, global_steps, replay_buffer):
         # replay buffer may be empty at first, we should rebuild at each training
@@ -503,16 +504,16 @@ class PolicyRayActorBase(RayActor):
 
         # TODO: only support packed sequences for now
         assert isinstance(experience.sequences, list)
-        sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
-        old_action_log_probs = torch.cat(experience.action_log_probs, dim=0).unsqueeze(0)
+        sequences = torch.stack(experience.sequences)
+        attention_mask = torch.stack(experience.attention_mask)
+        cat_old_action_log_probs = torch.cat(experience.action_log_probs, dim=0).unsqueeze(0)
         if experience.base_action_log_probs is not None:
-            base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
+            cat_base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
         else:
-            base_action_log_probs = None
-        advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
-        num_actions = torch.cat(experience.num_actions, dim=0).long().tolist()
-        packed_seq_lens = torch.cat(experience.packed_seq_lens, dim=0).long().tolist()
-        attention_mask = torch.cat(experience.attention_mask, dim=0).unsqueeze(0)
+            cat_base_action_log_probs = None
+        cat_advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
+        num_actions = [num_actions.flatten().long().tolist() for num_actions in experience.num_actions]
+        packed_seq_lens = [packed_seq_lens.flatten().long().tolist() for packed_seq_lens in experience.packed_seq_lens]
 
         # actor loss
         action_log_probs, output = self.model(
@@ -522,18 +523,17 @@ class PolicyRayActorBase(RayActor):
             return_output=True,
             packed_seq_lens=packed_seq_lens,
         )
-
-        # loss function
-        # TODO: recompute advantages
+        cat_action_log_probs = torch.cat(action_log_probs, dim=1)
         actor_loss = self.actor_loss_fn(
-            action_log_probs,
-            old_action_log_probs,
-            advantages,
+            cat_action_log_probs,
+            cat_old_action_log_probs,
+            cat_advantages,
             action_mask=experience.action_mask,
         )
+
         # clip ratio
         with torch.no_grad():
-            ratio = (action_log_probs - old_action_log_probs).exp()
+            ratio = (cat_action_log_probs - cat_old_action_log_probs).exp()
             clamp_ratio = ratio.clamp(1 - self.args.eps_clip, 1 + self.args.eps_clip)
             clip_ratio = (clamp_ratio != ratio).sum().item() / ratio.numel()
 
@@ -542,37 +542,40 @@ class PolicyRayActorBase(RayActor):
             assert isinstance(experience.sequences, list), "Only support packed sequences"
             action_logits = output["logits"][:, :-1, :]
             action_log_probs_all = torch.nn.functional.log_softmax(action_logits, dim=-1)
+            bsz = action_log_probs_all.shape[0]
 
-            action_log_probs_all_list = []
-            offset = 0
-            for num_action, seq_len in zip(num_actions, packed_seq_lens):
-                start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
-                action_log_probs_all_list.append(action_log_probs_all[:, start:end])
-                offset += seq_len
-            action_log_probs_all = torch.cat(action_log_probs_all_list, dim=1)
-
-            # Calculate entropy in chunks to avoid OOM
-            chunk_size = 512  # Adjust this value based on your GPU memory
-            num_chunks = (action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
             entropy_sum = 0
             total_tokens = 0
+            for i in range(bsz):
+                offset = 0
+                this_action_log_probs_all_list = []
+                this_num_actions, this_packed_seq_lens = num_actions[i], packed_seq_lens[i]
+                for num_action, seq_len in zip(this_num_actions, this_packed_seq_lens):
+                    start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
+                    this_action_log_probs_all_list.append(action_log_probs_all[i, start:end].unsqueeze(0))
+                    offset += seq_len
+                this_action_log_probs_all = torch.cat(this_action_log_probs_all_list, dim=1)
 
-            for i in range(num_chunks):
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, action_log_probs_all.size(1))
-                chunk = action_log_probs_all[:, start_idx:end_idx]
+                # Calculate entropy in chunks to avoid OOM
+                chunk_size = 512  # Adjust this value based on your GPU memory
+                num_chunks = (this_action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
 
-                # Calculate entropy for this chunk
-                chunk_probs = chunk.exp()
-                chunk_entropy = -(chunk_probs * chunk).sum(-1)
-                entropy_sum += chunk_entropy.sum().item()
-                total_tokens += chunk_entropy.numel()
+                for i in range(num_chunks):
+                    start_idx = i * chunk_size
+                    end_idx = min((i + 1) * chunk_size, action_log_probs_all.size(1))
+                    chunk = this_action_log_probs_all[:, start_idx:end_idx]
+
+                    # Calculate entropy for this chunk
+                    chunk_probs = chunk.exp()
+                    chunk_entropy = -(chunk_probs * chunk).sum(-1)
+                    entropy_sum += chunk_entropy.sum().item()
+                    total_tokens += chunk_entropy.numel()
 
             entropy = entropy_sum / total_tokens
 
         # kl loss
         if self.args.use_kl_loss and not self.args.disable_kl:
-            kl_loss = action_log_probs - base_action_log_probs
+            kl_loss = cat_action_log_probs - cat_base_action_log_probs
             if self.args.use_kl_estimator_k3:
                 kl_loss = -kl_loss
                 r = kl_loss.exp()
@@ -802,11 +805,11 @@ class CriticRayActorBase(RayActor):
         device = torch.cuda.current_device()
         self.model.eval()
         with torch.no_grad():
-            value = self.model(
+            values = self.model(
                 sequences.to(device), num_actions, attention_mask.to(device), packed_seq_lens=packed_seq_lens
             )
         self.model.train()  # reset model state
-        return value.to("cpu")
+        return [value.to("cpu") for value in values]
 
     def save_model(self, tokenizer, iteration):
         args = self.strategy.args
@@ -873,26 +876,30 @@ class CriticRayActorBase(RayActor):
     def training_step(self, experience: Experience, global_steps, local_step, accumulation_steps) -> Dict[str, float]:
 
         assert isinstance(experience.sequences, list)
-        sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
-        old_values = torch.cat(experience.values, dim=0).unsqueeze(0)
-        returns = torch.cat(experience.returns, dim=0).unsqueeze(0)
-        num_actions = torch.cat(experience.num_actions, dim=0).long().tolist()
-        packed_seq_lens = torch.cat(experience.packed_seq_lens, dim=0).long().tolist()
-        attention_mask = torch.cat(experience.attention_mask, dim=0).unsqueeze(0)
+        sequences = torch.stack(experience.sequences)
+        attention_mask = torch.stack(experience.attention_mask)
+        cat_returns = torch.cat(experience.returns, dim=0).unsqueeze(0)
+        cat_old_values = torch.cat(experience.values, dim=0).unsqueeze(0)
+
+        # [torch.randn((1,1)), torch.randn((1,1))] ---> [[1,2]]
+        num_actions = [num_actions.flatten().long().tolist() for num_actions in experience.num_actions]
+        packed_seq_lens = [packed_seq_lens.flatten().long().tolist() for packed_seq_lens in experience.packed_seq_lens]
 
         # critic loss
-        values, output = self.model(
+        values, _ = self.model(
             sequences,
             num_actions=num_actions,
             attention_mask=attention_mask,
             return_output=True,
             packed_seq_lens=packed_seq_lens,
         )
+
+        cat_values = torch.cat(values, dim=1)
         # loss function
         loss = self.critic_loss_fn(
-            values,
-            old_values,
-            returns,
+            cat_values,
+            cat_old_values,
+            cat_returns,
             action_mask=experience.action_mask,
         )
 
@@ -904,7 +911,7 @@ class CriticRayActorBase(RayActor):
         # status
         status = {
             "critic_loss": loss.item(),
-            "values": masked_mean(values, experience.action_mask).item(),
+            "values": masked_mean(cat_values, experience.action_mask).item(),
             "critic_lr": self.scheduler.get_last_lr()[0],
         }
         return status

@@ -163,7 +163,7 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         vals = value
         if isinstance(vals, torch.Tensor):
             vals = torch.unbind(vals)
-        assert batch_size == len(vals)
+        assert batch_size == len(vals), f"length of {key}: {len(vals)} is not equal to {batch_size}."
         for i, v in enumerate(vals):
             if isinstance(v, torch.Tensor):
                 v = v.clone()

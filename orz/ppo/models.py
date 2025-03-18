@@ -11,10 +11,6 @@ from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
-
-# Adapt from OpenRLHF
-
-
 def reset_ring_attn_position_ids(start, end, packed_seq_lens):
     """
     Calculate position ids for packed_seq_ids[start:end].
@@ -112,7 +108,7 @@ class Actor(nn.Module):
         super().__init__()
 
         if isinstance(pretrain_or_model, str):
-            attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+            attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
 
             # Note: dschf is defined in function scope to avoid global effects
             # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
@@ -217,15 +213,6 @@ class Actor(nn.Module):
         attention_mask = (sequences.ne(eos_token_id) & sequences.ne(pad_token_id)).to(dtype=torch.long)
         seq_length = attention_mask.size(1)
 
-        # The following code is equivalent to:
-        #
-        # for i in range(attention_mask.size(0)):
-        #     for t in reversed(range(seq_length)):
-        #         if attention_mask[i][t] > 0.5:
-        #             attention_mask[i][min(t + 1, seq_length - 1)] = True
-        #             sequences[i][min(t + 1, seq_length - 1)] = eos_token_id
-        #             break
-        #
         eos_indices = seq_length - attention_mask.long().fliplr().argmax(dim=1, keepdim=True).clamp(min=1)
         sequences.scatter_(dim=1, index=eos_indices, value=eos_token_id)
 
@@ -249,7 +236,7 @@ class Actor(nn.Module):
         return_output=False,
         ring_attn_group: Optional[dist.ProcessGroup] = None,
         packed_seq_lens: Optional[list[int]] = None,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         """Returns action log probs"""
         if not self.packing_samples:
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
@@ -272,21 +259,30 @@ class Actor(nn.Module):
 
         log_probs = log_probs_from_logits(output["logits"][:, :-1, :], sequences[:, 1:])
 
-        if not self.packing_samples:
-            action_log_probs = log_probs[:, -num_actions:]
+        bsz = log_probs.shape[0]
+
+        action_log_probs = []
+        for i in range(bsz):
+            this_action_log_probs = self._select_log_probs(log_probs[i].unsqueeze(0), num_actions[i], packed_seq_lens[i])
+            action_log_probs.append(this_action_log_probs)
+
+        if return_output:
+            return (action_log_probs, output)
         else:
-            assert isinstance(num_actions, list) and len(num_actions) == len(packed_seq_lens)
-            action_log_probs = []
+            return action_log_probs
+        
+    def _select_log_probs(self, log_probs, num_actions, packed_seq_lens):
+        if not self.packing_samples:
+            return log_probs[:, -num_actions:]
+        else:
             offset = 0
+            action_log_probs = []
+            assert isinstance(num_actions, list) and len(num_actions) == len(packed_seq_lens)
             for num_action, seq_len in zip(num_actions, packed_seq_lens):
                 start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
                 action_log_probs.append(log_probs[:, start:end])
                 offset += seq_len
             action_log_probs = torch.cat(action_log_probs, dim=1)
-
-        if return_output:
-            return (action_log_probs, output)
-        else:
             return action_log_probs
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={"use_reentrant": False}):
@@ -410,7 +406,8 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
             packed_seq_lens=None,
-        ) -> torch.Tensor:
+        ) -> list[torch.Tensor]:
+            # Return a list of tensors, because of unequal action sizes.
             if not self.packing_samples:
                 # https://github.com/OpenRLHF/OpenRLHF/issues/217
                 position_ids = attention_mask.long().cumsum(-1) - 1
@@ -433,23 +430,32 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 assert return_output
                 return outputs
 
-            if not self.packing_samples:
-                action_values = values[:, -num_actions:]
-            else:
-                assert isinstance(num_actions, list) and len(num_actions) == len(packed_seq_lens)
-                action_values = []
-                offset = 0
-                for num_action, seq_len in zip(num_actions, packed_seq_lens):
-                    start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
-                    action_values.append(values[:, start:end])
-                    offset += seq_len
-                action_values = torch.cat(action_values, dim=1)
+            bsz = values.shape[0]
+            action_values = []
+            for i in range(bsz):
+                this_action_values = self._select_values(values[i, :].unsqueeze(0), num_actions[i], packed_seq_lens[i])
+                action_values.append(this_action_values)
 
             if return_output:
                 return (action_values, outputs)
             else:
                 return action_values
 
+
+        def _select_values(self, values, num_actions, packed_seq_lens):
+            if not self.packing_samples:
+                return values[:, -num_actions:]
+            else:
+                offset = 0
+                action_values = []
+                assert isinstance(num_actions, list) and len(num_actions) == len(packed_seq_lens)
+                for num_action, seq_len in zip(num_actions, packed_seq_lens):
+                    start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
+                    action_values.append(values[:, start:end])
+                    offset += seq_len
+                action_values = torch.cat(action_values, dim=1)
+                return action_values
+            
     return CriticModel
 
 
