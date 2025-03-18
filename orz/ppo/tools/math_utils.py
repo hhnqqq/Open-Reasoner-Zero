@@ -415,9 +415,11 @@ def get_answer_str(s: str, return_origin=False) -> str:
     else:
         return None
 
-async def is_llm_equal(problem, predict, label):
-    client = OpenAI(api_key="Yzg1ZjJhZjZiYTcyM2JmOTQyOWQwYzcwY2NhYWI4YzM3YzY4NjlhOA==",
-                    base_url="http://1761768484581117.cn-wulanchabu.pai-eas.aliyuncs.com/api/predict/qwen_2_5_32b_instruct/v1")
+async def is_llm_equal(problem, predict, label, api_key=None, base_url=None):
+    if api_key is None or base_url is None:
+        return False
+    client = OpenAI(api_key=api_key,
+                    base_url=base_url)
     
     
     prompt = f'''
@@ -454,7 +456,9 @@ async def is_equal(str1,
                    answer_cannot_parsed, 
                    use_llm=False, 
                    use_full_answer=False, 
-                   math_mode="legacy"):
+                   math_mode="legacy",
+                   api_key=None,
+                   base_url=None):
     first_equal = is_equiv(str1, str2)
     if first_equal:
         return True
@@ -464,9 +468,9 @@ async def is_equal(str1,
     if use_llm:
         try:
             if str1 and str2 and prompt:
-                llm_equal = await is_llm_equal(prompt, str2, str1)
+                llm_equal = await is_llm_equal(prompt, str2, str1, api_key, base_url)
             elif use_full_answer and str1 and prompt and answer_cannot_parsed:
-                llm_equal = await is_llm_equal(prompt, answer_cannot_parsed, str1)
+                llm_equal = await is_llm_equal(prompt, answer_cannot_parsed, str1, api_key, base_url)
             else:
                 llm_equal = False
         except:
