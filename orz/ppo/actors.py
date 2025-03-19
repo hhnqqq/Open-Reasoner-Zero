@@ -540,29 +540,29 @@ class PolicyRayActorBase(RayActor):
         # entropy
         with torch.no_grad():
             assert isinstance(experience.sequences, list), "Only support packed sequences"
-            action_logits = output["logits"][:, :-1, :]
-            action_log_probs_all = torch.nn.functional.log_softmax(action_logits, dim=-1)
-            bsz = action_log_probs_all.shape[0]
+            bsz = output["logits"].shape[0]
 
             entropy_sum = 0
             total_tokens = 0
+            # Calculate entropy in chunks to avoid OOM
+            chunk_size = 64  # Adjust this value based on your GPU memory
             for i in range(bsz):
                 offset = 0
                 this_action_log_probs_all_list = []
                 this_num_actions, this_packed_seq_lens = num_actions[i], packed_seq_lens[i]
+                this_action_logits = output["logits"][i, :-1, :].unsqueeze(0)
+                this_action_log_probs_all = torch.nn.functional.log_softmax(this_action_logits, dim=-1)
                 for num_action, seq_len in zip(this_num_actions, this_packed_seq_lens):
                     start, end = max(0, offset + seq_len - num_action - 1), offset + seq_len - 1
-                    this_action_log_probs_all_list.append(action_log_probs_all[i, start:end].unsqueeze(0))
+                    this_action_log_probs_all_list.append(this_action_log_probs_all[:, start:end])
                     offset += seq_len
                 this_action_log_probs_all = torch.cat(this_action_log_probs_all_list, dim=1)
 
-                # Calculate entropy in chunks to avoid OOM
-                chunk_size = 512  # Adjust this value based on your GPU memory
                 num_chunks = (this_action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
 
                 for i in range(num_chunks):
                     start_idx = i * chunk_size
-                    end_idx = min((i + 1) * chunk_size, action_log_probs_all.size(1))
+                    end_idx = min((i + 1) * chunk_size, this_action_log_probs_all.size(1))
                     chunk = this_action_log_probs_all[:, start_idx:end_idx]
 
                     # Calculate entropy for this chunk
@@ -572,6 +572,8 @@ class PolicyRayActorBase(RayActor):
                     total_tokens += chunk_entropy.numel()
 
             entropy = entropy_sum / total_tokens
+            del this_action_logits, this_action_log_probs_all
+            torch.cuda.empty_cache()
 
         # kl loss
         if self.args.use_kl_loss and not self.args.disable_kl:
