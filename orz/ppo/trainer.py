@@ -138,11 +138,11 @@ class RayPPOTrainer:
                 # 4. train policy/critic model, based on adavantages
                 if self.cfg.colocate_all:
                     if self.critic_model is not None:
-                        async with Timer("Critic model training"):
+                        async with Timer("Critic model training with load and offload"):
                             await self.critic_model.backload_to_gpu()
                             await self.ppo_local_train_critic(critic_buffers, self.global_step)
                             await self.critic_model.offload_to_cpu()
-                    async with Timer("Actor model training"):
+                    async with Timer("Actor model training with load and offload"):
                         await self.policy_model.backload_to_gpu()
                         status = await self.ppo_local_train_policy(policy_buffers, self.global_step)
                         await self.policy_model.offload_to_cpu()
@@ -285,11 +285,7 @@ class RayPPOTrainer:
             # How many packed sequecnes. rollout_bsz * n_samples_per_prompt -> packed
             logger.info(f"experiences size: {len(experiences)}")
 
-        # 2. log generated results example
-        # vis = self._detokenize(experiences[0].sequences[0][: int(experiences[0].info["total_length"].flatten()[0])])
-        # wandb.log({"generated_sequences": wandb.Table(columns=["序列"], data=[[vis]])}, step=self.global_step)
-
-        # 3. calculate advantages and returns / along with tensorboard logging
+        # 2. calculate advantages and returns / along with tensorboard logging
         avg_rewards = 0
         avg_kl = 0
         avg_kl_max = 0
@@ -384,7 +380,8 @@ class RayPPOTrainer:
                     )
                 )
             results = await asyncio.gather(*dp_tasks)
-            results = sum(results, [])
+            # Gather the results from data parallel ranks.
+            results = list(chain(*results))
             return results
 
         if action_mask_all is not None:
@@ -406,7 +403,6 @@ class RayPPOTrainer:
             values = None
             if self.cfg.colocate_all:
                 values = await value_ref
-                values = list(chain(*values))
                 await self.critic_model.offload_to_cpu()
 
         # calculate ref log probs
@@ -423,7 +419,6 @@ class RayPPOTrainer:
         # handle colocate actor and ref model
         if (self.cfg.colocate_actor_ref or self.cfg.colocate_all) and not self.cfg.disable_kl:
             base_log_probs = await base_action_log_probs_ref
-            base_log_probs = list(chain(*base_log_probs))
             await self.ref_model.async_run_method("empty_cache")
 
         # calculate rewards
@@ -458,30 +453,25 @@ class RayPPOTrainer:
         action_log_probs = None
         if self.cfg.colocate_all:
             action_log_probs = await action_log_probs_ref
-            action_log_probs = list(chain(*action_log_probs))
             await self.policy_model.offload_to_cpu()
 
-        # wait all models done
-        # if not colocate_actor_ref, then need to gather base_log_probs
-        # if not colocate_critic_reward and self.critic_model is not None, then need to gather value
-        # reward_refs is always handled at last
         if not self.cfg.colocate_all:
             if not self.cfg.colocate_actor_ref:
                 if not self.cfg.colocate_critic_reward and self.critic_model is not None:
                     results = await asyncio.gather(
                         value_ref, base_action_log_probs_ref, action_log_probs_ref, *reward_refs
                     )
-                    values, base_log_probs, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), list(chain(*results[2])), results[3:]
+                    values, base_log_probs, action_log_probs, *rewards = results
                 else:
                     results = await asyncio.gather(base_action_log_probs_ref, action_log_probs_ref, *reward_refs)
-                    base_log_probs, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), results[2:]
+                    base_log_probs, action_log_probs, *rewards = results
             else:
                 if not self.cfg.colocate_critic_reward and self.critic_model is not None:
                     results = await asyncio.gather(value_ref, action_log_probs_ref, *reward_refs)
-                    values, action_log_probs, rewards = list(chain(*results[0])), list(chain(*results[1])), results[2:]
+                    values, action_log_probs, *rewards = results
                 else:
                     results = await asyncio.gather(action_log_probs_ref, *reward_refs)
-                    action_log_probs, rewards = list(chain(*results[0])), results[1:]
+                    action_log_probs, *rewards = results
 
         r = torch.stack(rewards).sum(dim=0) if len(rewards) > 0 else None
         if not self.cfg.colocate_all:
@@ -494,6 +484,13 @@ class RayPPOTrainer:
             if self.reward_model:
                 empty_cache_tasks.extend([rm.async_run_method("empty_cache") for rm in self.reward_model])
             await asyncio.gather(*empty_cache_tasks)
+
+        # The returns of models are lists of tensors, so we need to gather the returns again.
+        action_log_probs = list(chain(*action_log_probs))
+        if self.critic_model is not None:
+            values = list(chain(*values))
+        if not self.cfg.disable_kl:
+            base_log_probs = list(chain(*base_log_probs))
 
         # 6. calculate kl divergence
         experiences = []
@@ -1189,7 +1186,7 @@ class RayPPOTrainer:
         batch_size = len(batch_args[0])
         results = []
         # Process in micro batches
-        for i in tqdm(range(0, batch_size, micro_size), disable=(rank != 0), desc='Inferencing'):
+        for i in tqdm(range(0, batch_size, micro_size), disable=(rank != 0), desc='Forward inferencing on generated sequence'):
             # Take slice i:i+micro_size from each argument
             micro_batch_args = []
             for arg in batch_args:
