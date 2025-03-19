@@ -1,5 +1,7 @@
 import re
 import time
+import pynvml
+from threading import Thread
 from collections import defaultdict
 from typing import Optional, Tuple, Union
 
@@ -89,20 +91,48 @@ def get_eval_ds_config(
     }
 
 
+def init_pynvml():
+    pynvml.nvmlInit()
+
+def get_gpu_memory(device_id):
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return mem_info.used / 1024 / 1024 / 1024
+
 class Timer:
-    def __init__(self, message):
+    def __init__(self, message, device_id=0):
         self.message = message
+        self.device_id = device_id
+        self.memory_log = []
+        self.peak_memory = 0
+        self.running = False
+        self.monitor_thread = None
+
+    def _monitor_gpu_memory(self):
+        init_pynvml()
+        while self.running:
+            current_memory = get_gpu_memory(self.device_id)
+            self.memory_log.append(current_memory)
+            self.peak_memory = max(self.peak_memory, current_memory)
+            time.sleep(1)
 
     async def __aenter__(self):
         self.start_time = time.time()
+        self.running = True
+        self.monitor_thread = Thread(target=self._monitor_gpu_memory)
+        self.monitor_thread.start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.running = False
+        if self.monitor_thread:
+            self.monitor_thread.join()
+
         elapsed_time = time.time() - self.start_time
         hours = int(elapsed_time // 3600)
         minutes = int((elapsed_time % 3600) // 60)
         seconds = elapsed_time % 60
-        
+
         time_str = ""
         if hours > 0:
             time_str = f"{hours}h {minutes}m {seconds:.2f}s"
@@ -111,7 +141,9 @@ class Timer:
         else:
             time_str = f"{seconds:.2f}s"
             
-        logger.opt(depth=1).info(f"{self.message}, time cost: {time_str}")
+        logger.opt(depth=1).info(
+            f"{self.message}, time cost: {time_str}, peak GPU memory (device {self.device_id}): {self.peak_memory:.2f} GB"
+        )
 
 
 def _validate_args(args: DictConfig):
