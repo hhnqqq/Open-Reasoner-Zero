@@ -1,3 +1,4 @@
+import os
 import json
 from dataclasses import dataclass
 from functools import cached_property
@@ -18,6 +19,7 @@ from orz.ppo.utils import _validate_args, create_vllm_engines, get_strategy
 @dataclass
 class BasePPOExpConfig(BaseConfig):
     # resource related settings
+    exp_name: str = 'test_run'
     ref_num_nodes: int = 1
     ref_num_gpus_per_node: int = 2
     reward_num_nodes: int = 1
@@ -51,6 +53,7 @@ class BasePPOExpConfig(BaseConfig):
     bf16: bool = True
     zpg: int = 1
     adam_offload: bool = True
+    apply_liger: bool = True
     flash_attn: bool = True
     grad_accum_dtype: Optional[str] = None
     disable_trace_cache: bool = False
@@ -120,6 +123,7 @@ class BasePPOExpConfig(BaseConfig):
     enable_eval: bool = False
     eval_interval: int = -1
     update_ref_every_epoch: bool = False
+    enable_llm_judge: bool = False
 
 
 class BasePPOExp(BaseExp):
@@ -184,7 +188,7 @@ class BasePPOExp(BaseExp):
     @cached_property
     def get_colocate_pg(self):
         if self.cfg.colocate_all:
-            pg = placement_group([{"GPU": 1, "CPU": 1}] * self.cfg.vllm_num_engines, strategy="PACK")
+            pg = placement_group([{"GPU": 1, "CPU": 1}] * self.cfg.vllm_num_engines, strategy="SPREAD")
             ray.get(pg.ready())
             return pg
         else:
@@ -226,6 +230,7 @@ class BasePPOExp(BaseExp):
 
         # build the models
         # Call the trainer, so everything are initialized.
+        print(ray.available_resources())
         await self.trainer.build_models(self.PolicyRayActor, self.CriticRayActor, self.RefRayActor, self.RewardRayActor)
 
         # initialize the trainer and enter the training loop
