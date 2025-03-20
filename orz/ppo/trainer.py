@@ -16,8 +16,12 @@ from loguru import logger
 from itertools import chain
 from torch.utils.data import DataLoader
 from omegaconf.dictconfig import DictConfig
-from liger_kernel.transformers import apply_liger_kernel_to_qwen2
 from ray.util.placement_group import PlacementGroup, placement_group
+from liger_kernel.transformers import (
+    apply_liger_kernel_to_qwen2, 
+    apply_liger_kernel_to_llama, 
+    apply_liger_kernel_to_gemma2
+)
 
 from orz.ppo.actors import PPORayActorGroup
 from orz.ppo.replay_buffer import Experience, NaiveReplayBuffer
@@ -67,7 +71,6 @@ class RayPPOTrainer:
     async def train(self):
         # 1. create rank 0 policy model and vllm_engines groups, then boardcast weights to vllm engines
         if self.cfg.colocate_all:
-            await self.policy_model.backload_to_gpu()
             await self._backload_vllm_engines()
 
         await self.policy_model.async_run_method("_init_vllm_engines_actor_group", self.vllm_engines)
@@ -75,10 +78,6 @@ class RayPPOTrainer:
 
         async with Timer("Sync actor weights to vllm engines"):
             await self._sync_policy_weights_to_vllm()
-
-        if self.cfg.colocate_all:
-            async with Timer("Offload policy model to cpu"):
-                await self.policy_model.offload_to_cpu()
 
         # 2. main training loop
         consumed_samples = 0
@@ -104,7 +103,7 @@ class RayPPOTrainer:
 
                 # 1. eval if enable eval
                 if self.cfg.enable_eval and self.eval_dataset is not None and (
-                    self.global_step % self.cfg.eval_interval == 0 or iter == len(self.prompts_dataloader) - 1
+                    (self.global_step+1) % self.cfg.eval_interval == 0 or iter == len(self.prompts_dataloader) - 1
                 ):
                     await self.eval()
 
@@ -115,7 +114,6 @@ class RayPPOTrainer:
                 if len(self.replay_buffer) <= 0:
                     if self.cfg.colocate_all:
                         # skip, but transfer weight
-                        await self.policy_model.backload_to_gpu()
                         await self._backload_vllm_engines()
                         await self._sync_policy_weights_to_vllm()
                         await self.policy_model.offload_to_cpu()
@@ -138,14 +136,13 @@ class RayPPOTrainer:
                 # 4. train policy/critic model, based on adavantages
                 if self.cfg.colocate_all:
                     if self.critic_model is not None:
-                        async with Timer("Critic model training with load and offload"):
+                        async with Timer("Critic model training with colocate"):
                             await self.critic_model.backload_to_gpu()
                             await self.ppo_local_train_critic(critic_buffers, self.global_step)
                             await self.critic_model.offload_to_cpu()
-                    async with Timer("Actor model training with load and offload"):
+                    async with Timer("Actor model training with colocate"):
                         await self.policy_model.backload_to_gpu()
                         status = await self.ppo_local_train_policy(policy_buffers, self.global_step)
-                        await self.policy_model.offload_to_cpu()
                         
                 else:
                     if self.critic_model is not None:
@@ -258,8 +255,6 @@ class RayPPOTrainer:
 
         # 1.3 packing samples
         # Pack all prompts and outputs together.
-        # Example ret_sequences [1,1,1,2,2,2,2,0,0,0]
-        # Example num_actions [[1,2]]
         async with Timer("Packing samples"):
             (
                 ret_sequences,
@@ -592,13 +587,10 @@ class RayPPOTrainer:
         # place all model in same gpus
 
         if cfg.apply_liger:
-            apply_liger_kernel_to_qwen2(
-            rope=True,
-            swiglu=True,
-            cross_entropy=False,
-            fused_linear_cross_entropy=True,
-            rms_norm=True
-            )
+            for apply_liger_func in (apply_liger_kernel_to_qwen2, 
+                                    apply_liger_kernel_to_llama, 
+                                    apply_liger_kernel_to_gemma2):
+                apply_liger_func()
 
         if cfg.colocate_all:
             assert (
@@ -776,11 +768,12 @@ class RayPPOTrainer:
                        step=global_steps)
             await self.policy_model.async_run_method("empty_cache")
         if self.cfg.colocate_all:
-            async with Timer("Backload vllm engines to gpu"):
+            async with Timer("Offload policy model (without lp_params) and backload vllm engines to gpu"):
+                await self.policy_model.offload_to_cpu()
                 await self._backload_vllm_engines()
         async with Timer("Broadcast actor weights to vllm engines"):
             await self._sync_policy_weights_to_vllm()
-
+            
         if global_steps > self.cfg.freezing_actor_steps:
             return status[0]
 
@@ -1215,8 +1208,7 @@ class RayPPOTrainer:
             num_prompts = len(prompts)
             responses = [outputs[i].outputs[0].text for i in range(num_prompts)]
             finish_reasons = [outputs[i].outputs[0].finish_reason for i in range(num_prompts)]
-            # prompt_logprobs = [outputs[i].prompt_logprobs for i in range(num_prompts) if outputs[i].prompt_logprobs]
-            prompt_logprobs = []
+            prompt_logprobs = [outputs[i].prompt_logprobs for i in range(num_prompts) if outputs[i].prompt_logprobs]
 
             if len(prompt_logprobs) > 0:
                 return (
