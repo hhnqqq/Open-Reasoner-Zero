@@ -1,6 +1,7 @@
 import asyncio
 import re
 from openai import OpenAI
+from functools import partial
 from open_r1.utils import call_gpt
 from itertools import islice, zip_longest
 
@@ -415,7 +416,7 @@ def get_answer_str(s: str, return_origin=False) -> str:
     else:
         return None
 
-async def is_llm_equal(problem, predict, label, api_key=None, base_url=None):
+async def is_llm_equal(problem, predict, label, executor, api_key=None, base_url=None):
     if api_key is None or base_url is None:
         return False
     client = OpenAI(api_key=api_key,
@@ -438,11 +439,15 @@ Model output:
 
 Your judgement:
 '''
-    result = call_gpt(prompt=prompt, 
-                      client=client, 
-                      max_tokens=4096, 
-                      model='Qwen2.5-32b-Instruct',
-                      temperature=0.0001)
+    call_func = partial(call_gpt, 
+                        client=client, 
+                        max_tokens=4096, 
+                        model='qwen2-math-7b-instruct',
+                        temperature=0.0001)
+    
+    loop = asyncio.get_event_loop()
+    task = loop.run_in_executor(executor, call_func, prompt)
+    result = await asyncio.wait_for(task, timeout=5.0)
     try:
         reward = float(re.search(r'\d', result).group(0))
     except:
@@ -468,9 +473,19 @@ async def is_equal(str1,
     if use_llm:
         try:
             if str1 and str2 and prompt:
-                llm_equal = await is_llm_equal(prompt, str2, str1, api_key, base_url)
+                llm_equal = await is_llm_equal(prompt, 
+                                               str2, 
+                                               str1, 
+                                               executor, 
+                                               api_key, 
+                                               base_url)
             elif use_full_answer and str1 and prompt and answer_cannot_parsed:
-                llm_equal = await is_llm_equal(prompt, answer_cannot_parsed, str1, api_key, base_url)
+                llm_equal = await is_llm_equal(prompt, 
+                                               answer_cannot_parsed, 
+                                               str1, 
+                                               executor, 
+                                               api_key, 
+                                               base_url)
             else:
                 llm_equal = False
         except:
