@@ -172,7 +172,7 @@ class PPOExpConfig(BasePPOExpConfig):
     use_grpo: bool = False
     enable_llm_judge: bool = False
 
-    gpu_memory_utilization: float = 0.70
+    gpu_memory_utilization: float = 0.8
     critic_pretrain: Optional[str] = "" if use_grpo else pretrain
 
     gamma: float = 1.0
@@ -195,6 +195,7 @@ class CustomRewardTrainer(RayPPOTrainer):
         responses = []
         avg_non_stop_count = 0
         pass_at_n_dict = defaultdict(list)
+        rewards_by_file_dict = defaultdict(list)
         num_tokens: List[int] = []
 
         @ray.remote(num_cpus=1)
@@ -246,7 +247,7 @@ class CustomRewardTrainer(RayPPOTrainer):
         }, step=self.global_step)
 
         for idx in range(len(outputs)):
-            prompt, output, out_token = prompts[idx], outputs[idx], output_tokens[idx]
+            prompt, output, out_token, file_name = prompts[idx], outputs[idx], output_tokens[idx], extras[idx]['file_name']
             rep_score, reflection_pattern_score = repeat_scores[idx], reflection_pattern_scores[idx]
             iscorrect = output["iscorrect"]
             stop_reason = output["stop_reason"]
@@ -262,9 +263,10 @@ class CustomRewardTrainer(RayPPOTrainer):
             scores.append(score)
 
             # calculate pass@n
-            pass_at_n_dict[prompt].append(scores[-1])
+            pass_at_n_dict[prompt].append(score)
             # log num_tokens
             num_tokens.append(response_token)
+            rewards_by_file_dict[file_name].append(score)
 
         # must before grpo, for grpo will change scores
         num_tokens_arr = np.array(num_tokens, dtype=np.float32)  # must be float to calculate mean and std
@@ -311,6 +313,9 @@ class CustomRewardTrainer(RayPPOTrainer):
         }
         for k, v in log_dict.items():
             wandb.log({k: v}, step=self.global_step)
+        for k, v in rewards_by_file_dict.items():
+            wandb.log({f'avg_custom_reward_on_{k}':np.mean(v)}, step=self.global_step)
+
         logging_str = ",".join([f"{k}: {v:.4f}" for k, v in log_dict.items()])
         logger.info(logging_str)
 
@@ -368,9 +373,6 @@ class CustomRewardTrainer(RayPPOTrainer):
 
         @ray.remote(num_cpus=1)
         def extract_final_answers_batch(responses: List[str]) -> List[str]:
-            # pattern = re.compile(r"(\\boxed{.*})")
-            # only search for boxed content
-            # in physics, we can try to search first, and then extract the whole answer
             pattern = re.compile(r"<answer>.*?(\\boxed{.*}).*?</answer>", re.DOTALL)
             results = []
             results_can_not_parsed = []
@@ -399,17 +401,22 @@ class CustomRewardTrainer(RayPPOTrainer):
         batched_results = await asyncio.gather(*[asyncio.to_thread(ray.get, task) for task in extract_tasks])
         final_answers = [result for batch in batched_results for result in batch[0]]
         answers_can_not_parsed = [result_can_node_parserd for batch in batched_results for result_can_node_parserd in batch[1]]
-
+        # 判断对错
         global executor
         equal_tasks = []
-        for extra, final_answer, answer_can_not_parsed, prompt in zip(extras, final_answers, answers_can_not_parsed, prompts):
-            gold_answer = extra["answer"][0] if isinstance(extra["answer"], list) else extra["answer"]
-            equal_tasks.append(is_equal(solution2answer(str(gold_answer)), 
-                                        solution2answer(str(final_answer)), 
-                                        executor,
-                                        prompt,
-                                        answer_can_not_parsed))
-        equal_results = await asyncio.gather(*equal_tasks)
+        async with Timer('Judging if is correct'):
+            for extra, final_answer, answer_can_not_parsed, prompt in zip(extras, final_answers, answers_can_not_parsed, prompts):
+                gold_answer = extra["answer"][0] if isinstance(extra["answer"], list) else extra["answer"]
+                equal_tasks.append(is_equal(solution2answer(str(gold_answer)), 
+                                            solution2answer(str(final_answer)), 
+                                            executor,
+                                            prompt,
+                                            answer_can_not_parsed,
+                                            use_llm=self.cfg.enable_llm_judge,
+                                            use_full_answer=False,
+                                            api_key=os.environ.get('API_KEY', None),
+                                            base_url=os.environ.get('BASE_URL', None)))
+            equal_results = await asyncio.gather(*equal_tasks)
 
         results = []
         for extra, response, final_answer, stop_reason, iscorrect in zip(
@@ -461,7 +468,7 @@ class CustomRewardTrainer(RayPPOTrainer):
             for i, llm in enumerate(self.vllm_engines):
                 outputs.append(
                     llm.generate.remote(
-                        prompts=prompts[i * prompt_pre_llm : (i + 1) * prompt_pre_llm], sampling_params=sampling_params
+                        prompts=prompts[i * prompt_pre_llm : (i + 1) * prompt_pre_llm], sampling_params=sampling_params, use_tqdm=i==0
                     )
                 )
             outputs = await asyncio.gather(*outputs)
@@ -519,23 +526,24 @@ class CustomRewardTrainer(RayPPOTrainer):
             all_file_names
         )
 
-        dump_file_name = f"eval_output_iter{self.global_step}"
-        # join all acc from all_file_names
-        for file_name in all_file_names:
-            dump_file_name += f"_{file_name}{log_dict[f'{file_name}/accuracy']:.4f}"
-        dump_file_name += ".jsonl"
-        # dump as jsonl
-        with open(
-            os.path.join(
-                self.cfg.save_path,
-                dump_file_name,
-            ),
-            "w",
-        ) as f:
-            for item in output_for_save:
-                f.write(
-                    json.dumps(item, ensure_ascii=False) + "\n",
-                )
+        if not DEBUG_MODE:
+            dump_file_name = f"eval_output_iter{self.global_step}"
+            # join all acc from all_file_names
+            for file_name in all_file_names:
+                dump_file_name += f"_{file_name}{log_dict[f'{file_name}/accuracy']:.4f}"
+            dump_file_name += ".jsonl"
+            # dump as jsonl
+            with open(
+                os.path.join(
+                    self.cfg.save_path,
+                    dump_file_name,
+                ),
+                "w",
+            ) as f:
+                for item in output_for_save:
+                    f.write(
+                        json.dumps(item, ensure_ascii=False) + "\n",
+                    )
 
         logging_str = ",".join([f"{k}: {v:.4f}" for k, v in log_dict.items()])
         logger.info(logging_str)
